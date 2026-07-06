@@ -21,7 +21,6 @@ def extract_contact_id(url: str) -> str | None:
         match = re.search(pattern, url, re.IGNORECASE)
         if match:
             return match.group(1)
-    # фоллбэк
     clean = url.split('?')[0].split('#')[0].rstrip('/')
     parts = [p for p in clean.split('/') if p]
     if parts:
@@ -31,301 +30,276 @@ def extract_contact_id(url: str) -> str | None:
     return None
 
 
+def get_or_create_driver(profile_dir="/home/akozh/PycharmProjects/Maxer/browser_profile", existing_driver=None):
+    """Возвращает драйвер. Если передан — использует его, если нет — создаёт новый."""
+    if existing_driver:
+        return existing_driver, False
+    return Driver(uc=True, headless=False, user_data_dir=profile_dir), True
+
+
+def safe_quit_driver(driver, should_quit):
+    """Закрывает браузер только если мы его создавали сами."""
+    if should_quit and driver:
+        try:
+            driver.quit()
+        except:
+            pass
+
+
+# ==================== ФУНКЦИИ ====================
+
 def create_max_contacts_database(
     profile_dir: str = "/home/akozh/PycharmProjects/Maxer/browser_profile",
     output_file: str = "max_contacts_with_ids.json",
-    max_scrolls: int = 50
+    max_scrolls: int = 50,
+    driver=None
 ):
-    """
-    Полностью сканирует все контакты в MAX Web.
-    Кликает по каждому, получает ID из URL и сохраняет в JSON.
-    Поддерживает возобновление (не обрабатывает уже сохранённые контакты).
-    """
     logger.info("=== Запуск создания базы контактов MAX ===")
 
-    # Загружаем уже обработанные контакты (для возобновления)
     existing_results = []
     processed_names = set()
     try:
         with open(output_file, "r", encoding="utf-8") as f:
             existing_results = json.load(f)
             processed_names = {c["name"] for c in existing_results}
-            logger.info(f"Загружено {len(existing_results)} уже обработанных контактов")
     except FileNotFoundError:
         logger.info("Файл базы не найден — создаём новую")
 
-    with Driver(uc=True, headless=False, user_data_dir=profile_dir) as driver:
-        driver.get("https://web.max.ru")
-        driver.wait_for_element("button.cell", timeout=25)
+    driver_instance, should_quit = get_or_create_driver(profile_dir, driver)
+
+    try:
+        driver_instance.get("https://web.max.ru")
+        driver_instance.wait_for_element("button.cell", timeout=25)
         logger.info("Список чатов загружен")
 
-        # === Полностью прокручиваем список ===
         valid_contacts = []
-        seen = set(processed_names)  # уже обработанные пропускаем
-        last_height = driver.execute_script("return document.body.scrollHeight")
+        seen = set(processed_names)
+        last_height = driver_instance.execute_script("return document.body.scrollHeight")
         no_change_count = 0
 
-        while no_change_count < 3 and len(seen) < 5000:  # защита от бесконечного цикла
-            chat_elements = driver.find_elements("button.cell")
-
+        while no_change_count < 3 and len(seen) < 5000:
+            chat_elements = driver_instance.find_elements("button.cell")
             for chat in chat_elements:
                 try:
-                    name_el = chat.find_element("css selector", ".name.svelte-1riu5uh")
-                    name = name_el.text.strip()
-
-                    if (name and len(name) > 1 and
-                        "Вход" not in name and "Поиск" not in name and name not in seen):
-
-                        try:
-                            chat.find_element("css selector", "img, .avatar")
-                            has_avatar = True
-                        except:
-                            has_avatar = False
-
+                    name = chat.find_element("css selector", ".name.svelte-1riu5uh").text.strip()
+                    if name and len(name) > 1 and "Вход" not in name and "Поиск" not in name and name not in seen:
+                        has_avatar = bool(chat.find_elements("css selector", "img, .avatar"))
                         valid_contacts.append({"name": name, "has_avatar": has_avatar})
                         seen.add(name)
                 except:
                     continue
 
-            driver.execute_script("window.scrollBy(0, 900);")
+            driver_instance.execute_script("window.scrollBy(0, 900);")
             time.sleep(1.2)
-
-            new_height = driver.execute_script("return document.body.scrollHeight")
+            new_height = driver_instance.execute_script("return document.body.scrollHeight")
             if new_height == last_height:
                 no_change_count += 1
             else:
                 no_change_count = 0
                 last_height = new_height
 
-        logger.info(f"Найдено {len(valid_contacts)} новых контактов для обработки")
+        logger.info(f"Найдено {len(valid_contacts)} новых контактов")
 
-        # === Обрабатываем каждый контакт ===
         new_results = []
         for idx, contact in enumerate(valid_contacts, 1):
             name = contact["name"]
             logger.info(f"[{idx}/{len(valid_contacts)}] Обрабатываем: {name}")
-
             try:
                 name_esc = name.replace("'", "\\'").replace('"', '\\"')
-                xpath = (
-                    f"//button[contains(@class,'cell')]"
-                    f"[.//span[contains(@class,'name') and contains(normalize-space(.), '{name_esc}')]]"
-                )
-                button = driver.find_element("xpath", xpath)
+                xpath = f"//button[contains(@class,'cell')][.//span[contains(@class,'name') and contains(normalize-space(.), '{name_esc}')]]"
+                button = driver_instance.find_element("xpath", xpath)
 
-                old_url = driver.current_url
+                old_url = driver_instance.current_url
                 button.click()
 
-                changed = False
                 for _ in range(40):
                     time.sleep(0.5)
-                    if driver.current_url != old_url:
-                        changed = True
+                    if driver_instance.current_url != old_url:
                         break
-
-                if not changed:
-                    logger.warning(f"URL не изменился для {name}")
-                    driver.back()
-                    time.sleep(1)
+                else:
+                    driver_instance.back()
                     continue
 
-                new_url = driver.current_url
+                new_url = driver_instance.current_url
                 contact_id = extract_contact_id(new_url)
 
                 new_results.append({
                     "name": name,
                     "id": contact_id,
-                    "url_sample": new_url,
-                    "has_avatar": contact["has_avatar"]
+                    "chat_url": new_url
                 })
-                logger.info(f"  → ID: {contact_id}")
+                logger.info(f"→ chat_url: {new_url}")
 
-                driver.back()
-                driver.wait_for_element("button.cell", timeout=10)
+                driver_instance.back()
+                driver_instance.wait_for_element("button.cell", timeout=10)
                 time.sleep(random.uniform(1.0, 2.5))
 
             except Exception as e:
                 logger.error(f"Ошибка с '{name}': {e}")
                 try:
-                    driver.back()
-                    driver.wait_for_element("button.cell", timeout=8)
+                    driver_instance.back()
                 except:
                     pass
-                continue
 
-        # Объединяем старые + новые и сохраняем
         final_results = existing_results + new_results
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(final_results, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"=== Готово! Всего в базе: {len(final_results)} контактов ===")
-        logger.info(f"Файл сохранён: {output_file}")
+        logger.info(f"=== Готово! Всего контактов: {len(final_results)} ===")
+        return {"status": "успешно", "всего_в_базе": len(final_results)}
 
-        return {
-            "status": "успешно",
-            "новых_обработано": len(new_results),
-            "всего_в_базе": len(final_results),
-            "файл": output_file
-        }
+    finally:
+        safe_quit_driver(driver_instance, should_quit)
 
 
-def send_message_to_contact(
-    contact_name: str,
-    message: str,
-    json_file: str = "max_contacts_with_ids.json",
-    profile_dir: str = "/home/akozh/PycharmProjects/Maxer/browser_profile"
-):
-    logger.info(f"=== Отправка сообщения контакту: {contact_name} ===")
+def send_message_to_contact(contact_name: str, message: str, json_file="max_contacts_with_ids.json",
+                            profile_dir="/home/akozh/PycharmProjects/Maxer/browser_profile", driver=None):
+    logger.info(f"=== Отправка сообщения: {contact_name} ===")
 
-    # Загружаем базу контактов
+    with open(json_file, "r", encoding="utf-8") as f:
+        contacts = json.load(f)
+
+    contact = next((c for c in contacts if c["name"].lower() == contact_name.lower() or "избранное" in c["name"].lower()), None)
+    if not contact:
+        return {"status": "ошибка", "причина": "Контакт не найден"}
+
+    chat_url = contact.get("chat_url") or f"https://web.max.ru/{contact.get('id', '')}"
+
+    driver_instance, should_quit = get_or_create_driver(profile_dir, driver)
+
     try:
-        with open(json_file, "r", encoding="utf-8") as f:
-            contacts = json.load(f)
-    except FileNotFoundError:
-        return {"status": "ошибка", "причина": "Файл базы не найден"}
+        driver_instance.get(chat_url)
+        time.sleep(2.5)
 
-    contact = next(
-        (c for c in contacts if c["name"].lower() == contact_name.lower() or
-         "избранное" in c["name"].lower()),
-        None
-    )
-    if not contact or not contact.get("id"):
-        return {"status": "ошибка", "причина": f"Контакт '{contact_name}' не найден"}
+        input_el = driver_instance.wait_for_element("div.contenteditable.svelte-1k31az8", timeout=10)
+        input_el.click()
+        time.sleep(0.6)
 
-    contact_id = contact["id"]
-    chat_url = f"https://web.max.ru/{contact_id}"   # ← правильная ссылка
+        driver_instance.execute_script("""
+            const editor = arguments[0];
+            editor.focus();
+            const sel = window.getSelection();
+            sel.selectAllChildren(editor);
+            sel.deleteFromDocument();
+            document.execCommand('insertText', false, arguments[1]);
+            editor.dispatchEvent(new InputEvent('input', {bubbles: true}));
+        """, input_el, message)
 
-    with Driver(uc=True, headless=False, user_data_dir=profile_dir) as driver:
-        try:
-            driver.get(chat_url)
-            time.sleep(2.5)
+        from selenium.webdriver.common.keys import Keys
+        input_el.send_keys(Keys.ENTER)
+        time.sleep(1.5)
 
-            # Поиск поля ввода
-            input_element = driver.wait_for_element(
-                "div.contenteditable.svelte-1k31az8",
-                timeout=10
-            )
+        logger.info("✅ Сообщение отправлено")
+        return {"status": "успешно", "chat_url": chat_url}
 
-            input_element.click()
-            time.sleep(0.7)
-
-            # Вставка текста (Lexical)
-            driver.execute_script("""
-                const editor = arguments[0];
-                const text = arguments[1];
-                editor.focus();
-                const selection = window.getSelection();
-                selection.selectAllChildren(editor);
-                selection.deleteFromDocument();
-                document.execCommand('insertText', false, text);
-                editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
-            """, input_element, message)
-
-            time.sleep(0.6)
-
-            from selenium.webdriver.common.keys import Keys
-            input_element.send_keys(Keys.ENTER)
-
-            time.sleep(1.5)
-            logger.info("✅ Сообщение отправлено")
-
-            return {
-                "status": "успешно",
-                "контакт": contact_name,
-                "id": contact_id
-            }
-
-        except Exception as e:
-            logger.error(f"Ошибка при отправке: {e}")
-            return {"status": "ошибка", "причина": str(e)}
-
-    # Браузер автоматически закроется здесь (после выхода из with)
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return {"status": "ошибка", "причина": str(e)}
+    finally:
+        safe_quit_driver(driver_instance, should_quit)
 
 
-def get_last_messages(chat_name: str, count: int = 5) -> list[dict]:
-    """
-    Возвращает последние N сообщений из чата.
-    """
-    logger.info(f"Читаем последние {count} сообщений из чата: {chat_name}")
+def get_last_messages(chat_name: str, count: int = 5, profile_dir="/home/akozh/PycharmProjects/Maxer/browser_profile", driver=None):
+    logger.info(f"Читаем последние {count} сообщений из: {chat_name}")
 
-    # Находим контакт и переходим в чат (используем существующую логику)
-    try:
-        with open("max_contacts_with_ids.json", "r", encoding="utf-8") as f:
-            contacts = json.load(f)
-    except:
-        return []
+    with open("max_contacts_with_ids.json", "r", encoding="utf-8") as f:
+        contacts = json.load(f)
 
     contact = next((c for c in contacts if c["name"].lower() == chat_name.lower()), None)
-    if not contact or not contact.get("id"):
-        logger.error(f"Контакт {chat_name} не найден")
+    if not contact:
         return []
 
-    chat_url = f"https://web.max.ru/{contact['id']}"
+    chat_url = contact.get("chat_url") or f"https://web.max.ru/{contact.get('id', '')}"
 
-    with Driver(uc=True, headless=False, user_data_dir="/home/akozh/PycharmProjects/Maxer/browser_profile") as driver:
-        driver.get(chat_url)
+    driver_instance, should_quit = get_or_create_driver(profile_dir, driver)
+
+    try:
+        driver_instance.get(chat_url)
         time.sleep(3)
 
-        # Ищем все сообщения
-        bubbles = driver.find_elements("css selector", "div[data-bubbles-variant]")
-
-        if not bubbles:
-            logger.warning("Сообщения не найдены")
-            return []
-
-        # Берём последние N сообщений (они обычно в конце)
+        bubbles = driver_instance.find_elements("css selector", "div[data-bubbles-variant]")
         last_bubbles = bubbles[-count:] if len(bubbles) > count else bubbles
 
         messages = []
         for bubble in last_bubbles:
             try:
-                variant = bubble.get_attribute("data-bubbles-variant")
-                is_outgoing = variant == "outgoing"
-
-                # Текст сообщения
-                text_el = bubble.find_element("css selector", "span.text.svelte-1htnb3l")
-                text = text_el.text.strip()
-
-                # Время
+                variant = bubble.get_attribute("data-bubbles-variant") or ""
+                is_outgoing = "outgoing" in variant
+                text = bubble.find_element("css selector", "span.text.svelte-1htnb3l").text.strip()
                 try:
-                    time_el = bubble.find_element("css selector", "span.meta .text.svelte-13lobfv")
-                    msg_time = time_el.text.strip()
+                    msg_time = bubble.find_element("css selector", "span.meta .text").text.strip()
                 except:
                     msg_time = ""
 
-                sender = "Ты" if is_outgoing else chat_name
-
                 messages.append({
-                    "sender": sender,
+                    "sender": "Ты" if is_outgoing else chat_name,
                     "text": text,
                     "time": msg_time,
                     "is_outgoing": is_outgoing
                 })
-            except Exception as e:
+            except:
                 continue
 
-        logger.info(f"Получено {len(messages)} сообщений")
         return messages
+    finally:
+        safe_quit_driver(driver_instance, should_quit)
 
+
+# ==================== ТЕСТ ====================
 
 if __name__ == "__main__":
-    print("🚀 === ТЕСТ МАКСЕР ===\n")
+    print("🚀 === ТЕСТ ПАРСЕРА МАКСЕР (ОДИН БРАУЗЕР) ===\n")
+    errors = []
+    driver = None
 
-    # === ТЕСТ 1: Отправка сообщения ===
-    print("[1] Отправка сообщения в Избранное...")
-    send_result = send_message_to_contact(
-        contact_name="Избранное",
-        message="Тестовая отправка из Максер"
-    )
-    print("Результат отправки:", send_result)
+    try:
+        driver = Driver(uc=True, headless=False, user_data_dir="/home/akozh/PycharmProjects/Maxer/browser_profile")
 
-    # === ТЕСТ 2: Чтение последних сообщений ===
-    print("\n[2] Чтение последних 5 сообщений из Избранного...")
-    messages = get_last_messages("Избранное", count=5)
+        # 0. База контактов
+        print("[0] Создание базы контактов...")
+        try:
+            result = create_max_contacts_database(driver=driver)
+            print(f"✓ Успешно ({result['всего_в_базе']} контактов)")
+        except Exception as e:
+            errors.append(("create_max_contacts_database", str(e)))
+            print(f"✗ {e}")
 
-    print(f"Получено сообщений: {len(messages)}")
-    for i, msg in enumerate(messages, 1):
-        direction = "→" if msg["is_outgoing"] else "←"
-        print(f"{i}. {direction} [{msg['time']}] {msg['sender']}: {msg['text'][:80]}...")
+        time.sleep(2)
 
-    print("\n✅ Тест завершён")
+        # 1. Отправка
+        print("\n[1] Отправка сообщения в Избранное...")
+        try:
+            result = send_message_to_contact("Избранное", "Тест из одного браузера", driver=driver)
+            print("Результат:", result)
+        except Exception as e:
+            errors.append(("send_message_to_contact", str(e)))
+            print(f"✗ {e}")
+
+        time.sleep(2)
+
+        # 2. Чтение
+        print("\n[2] Чтение последних сообщений...")
+        try:
+            messages = get_last_messages("Избранное", count=5, driver=driver)
+            print(f"✓ Получено {len(messages)} сообщений")
+            for m in messages:
+                print(m)
+        except Exception as e:
+            errors.append(("get_last_messages", str(e)))
+            print(f"✗ {e}")
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
+    print("\n" + "="*55)
+    if errors:
+        print("❌ ОБНАРУЖЕННЫЕ ОШИБКИ:")
+        for name, err in errors:
+            print(f"  • {name}: {err}")
+    else:
+        print("✅ Все тесты прошли успешно!")
+    print("="*55)
