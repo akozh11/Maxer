@@ -218,7 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 # от себя
-tasks
 max_contacts_with_ids.json
 browser_profile
 downloaded_files
